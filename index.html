@@ -1346,24 +1346,28 @@ const db   = firebase.firestore();
 const provider = new firebase.auth.GoogleAuthProvider();
 
 // ══ DB em memória ════════════════════════════════════════════════════════
-let DB = {};
-let _saveTimer = null;
-let _currentUser = null;
+// Arquitetura: cada documento do Firestore = 1 registro (sem colisões)
+// Coleções: ordens | lancamentos | refs | pedidos | colaboradores |
+//           sucatas | retornosMetal | arvores | config | auditoria
 
-function _initDB(data){
-  DB = data || {};
-  if(!DB.ordens)        DB.ordens=[];
-  if(!DB.lancamentos)   DB.lancamentos=[];
-  if(!DB.colaboradores) DB.colaboradores=[];
-  if(!DB.metas)         DB.metas={};
-  if(!DB.auditoria)     DB.auditoria=[];
-  if(!DB.refs)          DB.refs=[];
-  if(!DB.pedidos)       DB.pedidos=[];
-  if(!DB.sucatas)       DB.sucatas=[];
-  if(!DB.retornosMetal) DB.retornosMetal=[];
+let DB = {};
+let _currentUser = null;
+let _listeners = [];       // unsubscribe functions para cleanup
+let _localLock = false;    // evita loop ao receber update remoto
+
+function _initDB(){
+  if(!DB.ordens)            DB.ordens=[];
+  if(!DB.lancamentos)       DB.lancamentos=[];
+  if(!DB.colaboradores)     DB.colaboradores=[];
+  if(!DB.metas)             DB.metas={};
+  if(!DB.auditoria)         DB.auditoria=[];
+  if(!DB.refs)              DB.refs=[];
+  if(!DB.pedidos)           DB.pedidos=[];
+  if(!DB.sucatas)           DB.sucatas=[];
+  if(!DB.retornosMetal)     DB.retornosMetal=[];
   if(!DB.quebrasTolerancia) DB.quebrasTolerancia={};
-  if(!DB.arvores)       DB.arvores=[];
-  if(!DB.cicloFund)     DB.cicloFund={prata:1,latao:101};
+  if(!DB.arvores)           DB.arvores=[];
+  if(!DB.cicloFund)         DB.cicloFund={prata:1,latao:101};
   // Seed colaboradores
   if(!DB.colaboradores.some(c=>c.cadastrado)){
     COLABORADORES_CATALOGO.forEach(cc=>{
@@ -1373,73 +1377,183 @@ function _initDB(data){
   }
 }
 
-// save() com debounce 1s — evita gravar a cada tecla
-function save(){
+// ── Helpers de ID seguro para chave Firestore ─────────────────────────
+function _safeId(id){ return String(id).replace(/[^a-zA-Z0-9_-]/g,'_').slice(0,100)||'_'; }
+
+// ── SAVE: grava apenas o que mudou ────────────────────────────────────
+// Chamado após qualquer mutação no DB. Detecta automaticamente o que salvar.
+let _dirtyCollections = new Set();
+let _saveTimer = null;
+
+function save(hint){
+  // hint = nome da coleção que mudou (opcional, ex: 'ordens')
+  if(hint) _dirtyCollections.add(hint);
+  else{
+    // sem hint = salva tudo
+    ['ordens','lancamentos','refs','pedidos','colaboradores',
+     'sucatas','retornosMetal','arvores','config'].forEach(c=>_dirtyCollections.add(c));
+  }
   setSyncStatus('syncing');
   clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(()=>_saveToFirestore(), 1000);
+  _saveTimer = setTimeout(_flushDirty, 800);
 }
 
-async function _saveToFirestore(){
-  if(!_currentUser) return;
+async function _flushDirty(){
+  if(!_currentUser || !_dirtyCollections.size) return;
+  const cols = [..._dirtyCollections];
+  _dirtyCollections.clear();
   try{
-    // Salva em chunks de 500KB (Firestore limite por doc = 1MB)
-    const chunks = _chunkDB(DB);
-    const batch = db.batch();
-    chunks.forEach((chunk, i)=>{
-      const ref = db.collection('dados').doc('db_' + i);
-      batch.set(ref, {data: JSON.stringify(chunk), ts: Date.now(), chunk: i, total: chunks.length});
-    });
-    await batch.commit();
+    for(const col of cols){
+      if(col==='config'){
+        // config = metas + cicloFund + quebrasTolerancia em um doc único
+        await db.collection('config').doc('main').set({
+          metas: DB.metas||{},
+          cicloFund: DB.cicloFund||{prata:1,latao:101},
+          quebrasTolerancia: DB.quebrasTolerancia||{}
+        });
+      } else {
+        const arr = DB[col];
+        if(!Array.isArray(arr)) continue;
+        const batch = db.batch();
+        arr.forEach(item=>{
+          const id = _safeId(item.id||item.nr||item.ref||item.nome||Date.now());
+          batch.set(db.collection(col).doc(id), _stripUndef(item));
+        });
+        // Marca itens deletados (registra ids existentes no doc _index)
+        batch.set(db.collection(col).doc('_index'), {
+          ids: arr.map(item=>_safeId(item.id||item.nr||item.ref||item.nome||'')),
+          ts: Date.now()
+        });
+        await batch.commit();
+      }
+    }
     setSyncStatus('ok');
+    // Backup local
+    try{ localStorage.setItem('fundDB4_backup', JSON.stringify(DB)); }catch(x){}
   } catch(e){
     console.error('Firestore save error:', e);
     setSyncStatus('error');
-    // Fallback: salva no localStorage também
-    try{ localStorage.setItem('fundDB4_backup', JSON.stringify(DB)); }catch(x){}
+    // Re-enfileira para tentar de novo
+    cols.forEach(c=>_dirtyCollections.add(c));
   }
 }
 
-function _chunkDB(data){
-  // Divide o DB em partes menores para não estourar limite de 1MB por documento
-  const str = JSON.stringify(data);
-  if(str.length < 800000) return [data]; // cabe num doc só
-  // Divide arrays grandes
-  const parts = [{}];
-  const keys = Object.keys(data);
-  let size = 0;
-  keys.forEach(k=>{
-    const val = JSON.stringify(data[k]);
-    if(size + val.length > 700000){ parts.push({}); size=0; }
-    parts[parts.length-1][k] = data[k];
-    size += val.length;
-  });
-  return parts;
+function _stripUndef(obj){
+  // Firestore não aceita undefined
+  return JSON.parse(JSON.stringify(obj, (k,v)=>v===undefined?null:v));
 }
 
+// ── LOAD: carrega todas as coleções na inicialização ──────────────────
 async function _loadFromFirestore(){
   try{
-    const snap = await db.collection('dados').get();
-    if(snap.empty){
-      // Primeira vez — tenta migrar do localStorage
-      const backup = localStorage.getItem('fundDB4') || localStorage.getItem('fundDB4_backup');
-      _initDB(backup ? JSON.parse(backup) : {});
-      save(); // persiste no Firestore
-    } else {
-      // Reconstrói DB dos chunks
-      const chunks = [];
-      snap.forEach(doc=>{ const d=doc.data(); chunks[d.chunk]={...JSON.parse(d.data)}; });
-      const merged = Object.assign({}, ...chunks.filter(Boolean));
-      _initDB(merged);
+    const COLS = ['ordens','lancamentos','refs','pedidos','colaboradores',
+                  'sucatas','retornosMetal','arvores'];
+    const promises = COLS.map(col=>db.collection(col).get());
+    promises.push(db.collection('config').doc('main').get());
+    const results = await Promise.all(promises);
+
+    // Coleções de array
+    COLS.forEach((col,i)=>{
+      const snap = results[i];
+      if(!snap.empty){
+        const items = [];
+        snap.forEach(doc=>{ if(doc.id!=='_index') items.push(doc.data()); });
+        DB[col] = items;
+      }
+    });
+
+    // Config
+    const cfgDoc = results[results.length-1];
+    if(cfgDoc.exists){
+      const cfg = cfgDoc.data();
+      DB.metas             = cfg.metas||{};
+      DB.cicloFund         = cfg.cicloFund||{prata:1,latao:101};
+      DB.quebrasTolerancia = cfg.quebrasTolerancia||{};
     }
+
+    _initDB();
+
+    // Se banco estava vazio — migra do localStorage
+    if(!DB.ordens.length && !DB.lancamentos.length){
+      const backup = localStorage.getItem('fundDB4') || localStorage.getItem('fundDB4_backup');
+      if(backup){
+        try{
+          const old = JSON.parse(backup);
+          ['ordens','lancamentos','refs','pedidos','colaboradores',
+           'sucatas','retornosMetal','arvores'].forEach(k=>{ if(old[k]?.length) DB[k]=old[k]; });
+          if(old.metas) DB.metas=old.metas;
+          if(old.cicloFund) DB.cicloFund=old.cicloFund;
+          if(old.quebrasTolerancia) DB.quebrasTolerancia=old.quebrasTolerancia;
+          save(); // persiste migração no Firestore
+          console.log('Migração localStorage → Firestore concluída');
+        }catch(x){ console.warn('Migração falhou:', x); }
+      }
+    }
+
     return true;
   } catch(e){
     console.error('Firestore load error:', e);
-    // Fallback offline
     const backup = localStorage.getItem('fundDB4') || localStorage.getItem('fundDB4_backup');
-    _initDB(backup ? JSON.parse(backup) : {});
+    if(backup){ try{ const old=JSON.parse(backup); Object.assign(DB,old); }catch(x){} }
+    _initDB();
     return false;
   }
+}
+
+// ── LISTENERS em tempo real ───────────────────────────────────────────
+// Escuta ordens e lançamentos — as coleções mais críticas para multi-usuário
+function _startListeners(){
+  _stopListeners();
+
+  const _onSnap = (col, snap) => {
+    if(_localLock) return; // ignora updates que vieram de nós mesmos
+    let changed = false;
+    snap.docChanges().forEach(change=>{
+      if(change.doc.id==='_index') return;
+      const item = change.doc.data();
+      if(change.type==='added'||change.type==='modified'){
+        const arr = DB[col];
+        const idField = col==='ordens'?'nr':col==='lancamentos'?'id':col==='refs'?'ref':'id';
+        const idx = arr.findIndex(x=>String(x[idField])===String(item[idField]||change.doc.id));
+        if(idx>=0){ if(JSON.stringify(arr[idx])!==JSON.stringify(item)){arr[idx]=item;changed=true;} }
+        else{ arr.push(item); changed=true; }
+      } else if(change.type==='removed'){
+        const arr = DB[col];
+        const before = arr.length;
+        const idField = col==='ordens'?'nr':col==='lancamentos'?'id':col==='refs'?'ref':'id';
+        DB[col] = arr.filter(x=>String(x[idField])!==change.doc.id);
+        if(DB[col].length!==before) changed=true;
+      }
+    });
+    if(changed) _rerender(col);
+  };
+
+  ['ordens','lancamentos','pedidos','arvores'].forEach(col=>{
+    const unsub = db.collection(col).onSnapshot(
+      snap=>_onSnap(col,snap),
+      err=>console.warn('Listener error',col,err)
+    );
+    _listeners.push(unsub);
+  });
+}
+
+function _stopListeners(){
+  _listeners.forEach(u=>u());
+  _listeners=[];
+}
+
+// Re-renderiza a aba ativa quando dados chegam de outro PC
+const _RENDER_MAP = {
+  ordens:      ()=>{ try{renderPorOrdem();}catch(e){} try{renderPorProcesso();}catch(e){} try{renderDashboard();}catch(e){} },
+  lancamentos: ()=>{ try{renderPorOrdem();}catch(e){} try{renderMetal();}catch(e){} try{renderQuebras();}catch(e){} try{renderDashboard();}catch(e){} },
+  pedidos:     ()=>{ try{renderPedidos();}catch(e){} },
+  arvores:     ()=>{ try{renderArvores();}catch(e){} },
+};
+
+function _rerender(col){
+  const fn = _RENDER_MAP[col];
+  if(fn) fn();
+  atualizarBadges();
 }
 
 function setSyncStatus(status){
@@ -1476,12 +1590,15 @@ auth.onAuthStateChanged(async user=>{
     // Carrega dados
     await _loadFromFirestore();
     document.getElementById('loadingScreen').classList.add('hidden');
+    // Inicia listeners em tempo real para multi-usuário
+    _startListeners();
     // Renderiza app
     atualizarBadges();
     goPage('lancamento', document.querySelector('.tab'));
     setSyncStatus('ok');
   } else {
     _currentUser = null;
+    _stopListeners();
     document.getElementById('loginScreen').classList.remove('hidden');
     document.getElementById('loadingScreen').classList.add('hidden');
     document.getElementById('userBar').style.display='none';
@@ -1558,10 +1675,7 @@ function checarBackupAuto(){
   const diasSemBackup=ultima?((agora-ultima)/(1000*60*60*24)):999;
   const el=document.getElementById('backupInfo');
   // Snapshot automatico no localStorage (nao é o backup exportado, mas protege contra reload)
-  try{
-    const snap={...DB,_snapTs:agora.toISOString()};
-    // snapshot migrado para Firestore
-  }catch(e){}
+  try{ /* snapshot migrado para Firestore */ }catch(e){}
   if(el){
     if(diasSemBackup>=7){
       el.innerHTML=`<span style="color:var(--accent);">⚠️ Último backup: ${ultima?ultima.toLocaleDateString('pt-BR'):'nunca'} — Recomendamos exportar agora!</span>`;
@@ -2120,7 +2234,7 @@ function gerarLoteRecuperavel(ordemPai, qtd, procInicio, defeito){
     });
   });
   audit('RECUPERÁVEL','Sublote #'+nr+' gerado a partir de #'+ordemPai+' — entra em: '+procInicio,{nr,ordemPai,qtd,procInicio,defeito});
-  save();
+  save('ordens');
   atualizarBadgeGargalo();
   renderPorOrdem();
   fecharModal();
@@ -2154,7 +2268,7 @@ function gerarRetrabalhoAuto(ordemPai, qtd, defeito, proc){
     turno:'', pcHora:null, filaAuto:true,
   });
   audit('RETRABALHO','Retrabalho #'+nr+' gerado de #'+ordemPai+' — '+defeito+' em '+proc,{nr,ordemPai,qtd,defeito,proc});
-  save();
+  save('lancamentos');
   atualizarBadgeGargalo();
   renderPorOrdem();
   fecharModal();
@@ -3531,7 +3645,7 @@ function salvarPedido(){
   };
   DB.pedidos.push(p);
   audit('PEDIDO','Pedido #'+nr+' criado — '+ref+' × '+qtd+'pç',p);
-  save(); atualizarBadgePedidos(); renderPedidos(); fecharModal();
+  save('pedidos'); atualizarBadgePedidos(); renderPedidos(); fecharModal();
   toast('🛒 Pedido #'+nr+' criado!','ok');
 }
 
@@ -3748,7 +3862,7 @@ function avancarNrArvore(metal){
 function novoCicloFund(){
   if(!confirm('Reiniciar numeração das árvores?\nPrata voltará a 001, Latão a 101.\nAs árvores já salvas não são apagadas.')) return;
   DB.cicloFund = {prata:1, latao:101};
-  save();
+  save('config');
   toast('🔄 Numeração reiniciada — Prata: 001 | Latão: 101','ok');
   renderArvores();
 }
@@ -3887,7 +4001,7 @@ function salvarArvore(){
 
   DB.arvores.push(arvore);
   avancarNrArvore(metal);
-  save();
+  save('arvores');
   fecharModal();
   toast(`✅ Árvore ${arvore.nrDisplay} (${metal==='prata'?'Prata':'Latão'}) criada!`,'ok');
   renderArvores();
@@ -4137,7 +4251,7 @@ function salvarTolerancia(){
   });
   if(!ok) return;
   audit('CONFIG','Tolerâncias de quebra salvas',DB.quebrasTolerancia);
-  save();
+  save('config');
   toast('✅ Tolerâncias salvas — alertas ativos na aba Metal','ok');
   renderConfigTolerancia(); // re-render para atualizar as badges de nível
 }
@@ -4976,7 +5090,7 @@ function salvarCadRef(){
     toast('✅ Referência '+ref+' cadastrada!','ok');
   }
   audit('CADASTRO REF',(_editingRef?'Editada':'Nova')+' referência: '+ref, novaRef);
-  save();
+  save('refs');
   fecharFormCadRef();
   renderCadastroRefs();
 }
